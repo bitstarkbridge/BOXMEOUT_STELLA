@@ -1,6 +1,5 @@
 # Dependencies
 node_modules/
-package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
@@ -36,4 +35,7 @@ coverage/
 Thumbs.db
 
 # Prisma
-prisma/migrations/**/migration.sql
+prisma/dev.db
+prisma/test.db
+*.db
+*.sqlite
