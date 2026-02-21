@@ -1,7 +1,7 @@
 // contracts/amm.rs - Automated Market Maker for Outcome Shares
 // Enables trading YES/NO outcome shares with dynamic odds pricing (Polymarket model)
 
-use soroban_sdk::{contract, contractevent, contractimpl, token, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec};
 
 #[contractevent]
 pub struct AmmInitializedEvent {
@@ -47,6 +47,17 @@ pub struct LiquidityRemovedEvent {
     pub no_amount: u128,
 }
 
+/// Trade record for recent trades history
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Trade {
+    pub trader: Address,
+    pub outcome: u32,
+    pub quantity: u128,
+    pub price: u128,
+    pub timestamp: u64,
+}
+
 // Storage keys
 const ADMIN_KEY: &str = "admin";
 const FACTORY_KEY: &str = "factory";
@@ -64,6 +75,11 @@ const POOL_K_KEY: &str = "pool_k";
 const POOL_LP_SUPPLY_KEY: &str = "pool_lp_supply";
 const POOL_LP_TOKENS_KEY: &str = "pool_lp_tokens";
 const USER_SHARES_KEY: &str = "user_shares";
+
+// Trade history storage keys
+const RECENT_TRADES_KEY: &str = "recent_trades";
+const TRADE_COUNT_KEY: &str = "trade_count";
+const MAX_RECENT_TRADES: usize = 100;
 
 // Pool data structure
 #[derive(Clone)]
@@ -338,6 +354,14 @@ impl AMM {
             .persistent()
             .set(&user_share_key, &(current_shares + shares_out));
 
+        // Record trade with price = amount / shares_out (USDC per share)
+        let price = if shares_out > 0 {
+            amount / shares_out
+        } else {
+            0
+        };
+        Self::record_trade(env.clone(), market_id.clone(), buyer.clone(), outcome, shares_out, price);
+
         // Record trade (Optional: Simplified to event only for this resolution)
         BuySharesEvent {
             buyer,
@@ -474,6 +498,14 @@ impl AMM {
             &seller,
             &(payout_after_fee as i128),
         );
+
+        // Record trade with price = payout_after_fee / shares (USDC per share)
+        let price = if shares > 0 {
+            payout_after_fee / shares
+        } else {
+            0
+        };
+        Self::record_trade(env.clone(), market_id.clone(), seller.clone(), outcome, shares, price);
 
         // Emit SellShares event
         SellSharesEvent {
@@ -766,4 +798,65 @@ impl AMM {
     // - get_lp_position() / claim_lp_fees()
     // - calculate_spot_price()
     // - get_trade_history()
+
+    /// Record a trade in the recent trades history (capped at 100 entries)
+    /// Maintains a FIFO queue by removing oldest trade when limit is reached
+    fn record_trade(
+        env: Env,
+        market_id: BytesN<32>,
+        trader: Address,
+        outcome: u32,
+        quantity: u128,
+        price: u128,
+    ) {
+        let trades_key = (Symbol::new(&env, RECENT_TRADES_KEY), market_id.clone());
+        let count_key = (Symbol::new(&env, TRADE_COUNT_KEY), market_id.clone());
+
+        // Get current trades vector
+        let mut trades: Vec<Trade> = env
+            .storage()
+            .persistent()
+            .get(&trades_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Create new trade record
+        let new_trade = Trade {
+            trader,
+            outcome,
+            quantity,
+            price,
+            timestamp: env.ledger().timestamp(),
+        };
+
+        // If at capacity, remove oldest trade (FIFO)
+        if trades.len() >= MAX_RECENT_TRADES as u32 {
+            // Remove first element by creating a new vec without it
+            let mut new_trades = Vec::new(&env);
+            for i in 1..trades.len() {
+                new_trades.push_back(trades.get(i).unwrap());
+            }
+            trades = new_trades;
+        }
+
+        // Add new trade to end
+        trades.push_back(new_trade);
+
+        // Update storage
+        env.storage().persistent().set(&trades_key, &trades);
+        env.storage()
+            .persistent()
+            .set(&count_key, &(trades.len() as u32));
+    }
+
+    /// Get recent trades for a market (up to 100 entries)
+    /// Returns trades in chronological order (oldest first)
+    /// Includes: trader address, outcome (0=NO, 1=YES), quantity, price, timestamp
+    pub fn get_recent_trades(env: Env, market_id: BytesN<32>) -> Vec<Trade> {
+        let trades_key = (Symbol::new(&env, RECENT_TRADES_KEY), market_id);
+
+        env.storage()
+            .persistent()
+            .get(&trades_key)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
 }
