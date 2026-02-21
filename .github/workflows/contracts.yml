@@ -54,9 +54,12 @@ jobs:
 
       - name: Build WASM contracts
         working-directory: contracts/contracts/boxmeout
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: List WASM artifacts
         run: |
-          cargo build --release --target wasm32-unknown-unknown
-          ls -lh target/wasm32-unknown-unknown/release/*.wasm
+          ls -lh contracts/target/wasm32-unknown-unknown/release/*.wasm
+          find contracts/target -name "*.wasm" -type f
 
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin
@@ -77,5 +80,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: contract-wasm
-          path: contracts/contracts/boxmeout/target/wasm32-unknown-unknown/release/*.wasm
+          path: contracts/target/wasm32-unknown-unknown/release/boxmeout.wasm
           retention-days: 7
