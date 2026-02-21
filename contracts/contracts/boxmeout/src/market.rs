@@ -65,6 +65,7 @@ const NO_POOL_KEY: &str = "no_pool";
 const TOTAL_VOLUME_KEY: &str = "total_volume";
 const PENDING_COUNT_KEY: &str = "pending_count";
 const COMMIT_PREFIX: &str = "commit";
+const PARTICIPANTS_KEY: &str = "participants";
 const PREDICTION_PREFIX: &str = "prediction";
 const WINNING_OUTCOME_KEY: &str = "winning_outcome";
 const WINNER_SHARES_KEY: &str = "winner_shares";
@@ -75,6 +76,7 @@ const STATE_OPEN: u32 = 0;
 const STATE_CLOSED: u32 = 1;
 const STATE_RESOLVED: u32 = 2;
 const STATE_DISPUTED: u32 = 3;
+const STATE_CANCELLED: u32 = 4;
 
 /// Error codes following Soroban best practices
 #[contracterror]
@@ -153,6 +155,22 @@ pub struct UserPredictionResult {
     pub status: u32,
     /// 0=NO, 1=YES when revealed; PREDICTION_OUTCOME_NONE when committed
     pub predicted_outcome: u32,
+}
+
+/// Market state summary for backend sync
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketState {
+    /// Current market status: 0=OPEN, 1=CLOSED, 2=RESOLVED
+    pub status: u32,
+    /// Market closing timestamp
+    pub closing_time: u64,
+    /// Total pool size (yes_pool + no_pool)
+    pub total_pool: i128,
+    /// Number of participants (pending + revealed predictions)
+    pub participant_count: u32,
+    /// Winning outcome (0=NO, 1=YES), None if not resolved
+    pub winning_outcome: Option<u32>,
 }
 
 /// PREDICTION MARKET - Manages individual market logic
@@ -327,6 +345,17 @@ impl PredictionMarket {
         };
 
         env.storage().persistent().set(&commit_key, &commitment);
+
+        // Add user to participants (for cancel refunds)
+        let mut participants: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, PARTICIPANTS_KEY))
+            .unwrap_or_else(|| Vec::new(&env));
+        participants.push_back(user.clone());
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, PARTICIPANTS_KEY), &participants);
 
         // Update pending count
         let pending_count: u32 = env
@@ -807,17 +836,68 @@ impl PredictionMarket {
 
     /// Get market summary data
     ///
-    /// TODO: Get Market State
-    /// - Query market metadata from storage
-    /// - Return: market_id, creator, category, title, description
-    /// - Include timing: creation_time, closing_time, resolution_time, time_remaining
-    /// - Include current state: OPEN/CLOSED/RESOLVED/DISPUTED
-    /// - Include pools: yes_volume, no_volume, total_volume
-    /// - Include odds: yes_odds, no_odds
-    /// - Include resolution: winning_outcome (if resolved), timestamp
-    /// - Include user-specific data if user provided: their prediction, potential winnings
-    pub fn get_market_state(_env: Env, _market_id: BytesN<32>) -> Symbol {
-        todo!("See get market state TODO above")
+    /// Returns current market state including status, timing, pool size, and resolution data.
+    /// This is a read-only function that requires no authentication.
+    ///
+    /// # Returns
+    /// - status: Current market state (0=OPEN, 1=CLOSED, 2=RESOLVED)
+    /// - closing_time: When the market closes for new predictions
+    /// - total_pool: Combined size of yes_pool + no_pool
+    /// - participant_count: Number of pending commitments
+    /// - winning_outcome: Final outcome if resolved (0=NO, 1=YES), None otherwise
+    pub fn get_market_state(env: Env, _market_id: BytesN<32>) -> MarketState {
+        // Get market status
+        let status: u32 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, MARKET_STATE_KEY))
+            .unwrap_or(STATE_OPEN);
+
+        // Get closing time
+        let closing_time: u64 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, CLOSING_TIME_KEY))
+            .unwrap_or(0);
+
+        // Get pool sizes
+        let yes_pool: i128 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, YES_POOL_KEY))
+            .unwrap_or(0);
+
+        let no_pool: i128 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, NO_POOL_KEY))
+            .unwrap_or(0);
+
+        let total_pool = yes_pool + no_pool;
+
+        // Get participant count (pending commitments)
+        let participant_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, PENDING_COUNT_KEY))
+            .unwrap_or(0);
+
+        // Get winning outcome if market is resolved
+        let winning_outcome: Option<u32> = if status == STATE_RESOLVED {
+            env.storage()
+                .persistent()
+                .get(&Symbol::new(&env, WINNING_OUTCOME_KEY))
+        } else {
+            None
+        };
+
+        MarketState {
+            status,
+            closing_time,
+            total_pool,
+            participant_count,
+            winning_outcome,
+        }
     }
 
     /// Get prediction records for a user in this market
@@ -970,21 +1050,100 @@ impl PredictionMarket {
 
     /// Emergency function: Market creator can cancel unresolved market
     ///
-    /// TODO: Cancel Market (Creator Only)
-    /// - Require market creator authentication
+    /// - Require creator authentication
     /// - Validate market state is OPEN or CLOSED (not resolved)
-    /// - Return all user USDC balances (full refund)
-    /// - Loop through all users with predictions
-    /// - Transfer their full amounts back from escrow
-    /// - Handle any transfer failures (log but continue)
+    /// - Refund all participants (commitments and predictions)
     /// - Set market state to CANCELLED
-    /// - Emit MarketCancelled(market_id, reason, creator, timestamp)
-    pub fn cancel_market(_env: Env, _creator: Address, _market_id: BytesN<32>) {
-        todo!("See cancel market TODO above")
+    /// - Emit MarketCancelled(market_id, creator, timestamp)
+    pub fn cancel_market(env: Env, creator: Address, market_id: BytesN<32>) {
+        creator.require_auth();
+
+        let stored_creator: Address = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, CREATOR_KEY))
+            .expect("Market not initialized");
+
+        if creator != stored_creator {
+            panic!("Unauthorized: only creator can cancel");
+        }
+
+        let state: u32 = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, MARKET_STATE_KEY))
+            .expect("Market state not found");
+
+        if state == STATE_RESOLVED {
+            panic!("Cannot cancel resolved market");
+        }
+        if state == STATE_CANCELLED {
+            panic!("Market already cancelled");
+        }
+
+        let usdc: Address = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, USDC_KEY))
+            .expect("USDC token not found");
+        let token_client = token::TokenClient::new(&env, &usdc);
+        let contract = env.current_contract_address();
+
+        let participants: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, PARTICIPANTS_KEY))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let len = participants.len();
+        for i in 0..len {
+            let user = participants.get(i).expect("participant");
+            if let Some(commitment) = Self::get_commitment(env.clone(), user.clone()) {
+                if commitment.amount > 0 {
+                    token_client.transfer(&contract, &user, &commitment.amount);
+                }
+                env.storage()
+                    .persistent()
+                    .remove(&Self::get_commit_key(&env, &user));
+            } else if let Some(pred) = Self::test_get_prediction(env.clone(), user.clone()) {
+                if pred.amount > 0 {
+                    token_client.transfer(&contract, &user, &pred.amount);
+                }
+                let pred_key = (Symbol::new(&env, PREDICTION_PREFIX), user.clone());
+                env.storage().persistent().remove(&pred_key);
+            }
+        }
+
+        env.storage().persistent().set(
+            &Symbol::new(&env, PARTICIPANTS_KEY),
+            &Vec::<Address>::new(&env),
+        );
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, MARKET_STATE_KEY), &STATE_CANCELLED);
+
+        let timestamp = env.ledger().timestamp();
+        env.events().publish(
+            (Symbol::new(&env, "MarketCancelled"),),
+            (market_id, creator, timestamp),
+        );
     }
 
     // --- TEST HELPERS (Not for production use, but exposed for integration tests) ---
     // In a real production contract, these would be removed or gated behind a feature flag.
+
+    /// Test helper: Add user to participants (for cancel tests that bypass commit)
+    pub fn test_add_participant(env: Env, user: Address) {
+        let mut participants: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, PARTICIPANTS_KEY))
+            .unwrap_or_else(|| Vec::new(&env));
+        participants.push_back(user);
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(&env, PARTICIPANTS_KEY), &participants);
+    }
 
     /// Test helper: Set a user's prediction directly (bypasses commit/reveal)
     pub fn test_set_prediction(env: Env, user: Address, outcome: u32, amount: i128) {
