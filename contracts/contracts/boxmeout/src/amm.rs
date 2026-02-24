@@ -1,9 +1,7 @@
 // contracts/amm.rs - Automated Market Maker for Outcome Shares
 // Enables trading YES/NO outcome shares with dynamic odds pricing (Polymarket model)
 
-use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, token, Address, BytesN, Env, Symbol, Vec,
-};
+use soroban_sdk::{contract, contractevent, contractimpl, token, Address, BytesN, Env, Symbol};
 
 #[contractevent]
 pub struct AmmInitializedEvent {
@@ -90,6 +88,36 @@ pub struct Pool {
     pub no_reserve: u128,
     pub total_liquidity: u128,
     pub created_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityAdded {
+    pub provider: Address,
+    pub usdc_amount: u128,
+    pub lp_tokens_minted: u128,
+    pub new_reserve: u128,
+    pub k: u128,
+}
+
+fn calculate_lp_tokens_to_mint(
+    current_lp_supply: u128,
+    current_total_liquidity: u128,
+    usdc_amount: u128,
+) -> u128 {
+    if current_lp_supply == 0 {
+        // First LP receives 1:1 LP tokens for deposited liquidity.
+        return usdc_amount;
+    }
+
+    if current_total_liquidity == 0 {
+        panic!("invalid pool liquidity");
+    }
+
+    usdc_amount
+        .checked_mul(current_lp_supply)
+        .and_then(|v| v.checked_div(current_total_liquidity))
+        .expect("lp mint calculation overflow")
 }
 
 /// AUTOMATED MARKET MAKER - Manages liquidity pools and share trading
@@ -591,6 +619,130 @@ impl AMM {
         }
 
         (yes_odds, no_odds)
+    }
+
+    /// Add USDC liquidity to an existing pool and mint LP tokens proportionally.
+    /// Returns minted LP token amount.
+    pub fn add_liquidity(
+        env: Env,
+        lp_provider: Address,
+        market_id: BytesN<32>,
+        usdc_amount: u128,
+    ) -> u128 {
+        lp_provider.require_auth();
+
+        if usdc_amount == 0 {
+            panic!("usdc amount must be greater than 0");
+        }
+
+        let pool_exists_key = (Symbol::new(&env, POOL_EXISTS_KEY), market_id.clone());
+        if !env.storage().persistent().has(&pool_exists_key) {
+            panic!("pool does not exist");
+        }
+
+        let yes_reserve_key = (Symbol::new(&env, POOL_YES_RESERVE_KEY), market_id.clone());
+        let no_reserve_key = (Symbol::new(&env, POOL_NO_RESERVE_KEY), market_id.clone());
+        let k_key = (Symbol::new(&env, POOL_K_KEY), market_id.clone());
+        let lp_supply_key = (Symbol::new(&env, POOL_LP_SUPPLY_KEY), market_id.clone());
+        let lp_balance_key = (
+            Symbol::new(&env, POOL_LP_TOKENS_KEY),
+            market_id.clone(),
+            lp_provider.clone(),
+        );
+
+        let yes_reserve: u128 = env
+            .storage()
+            .persistent()
+            .get(&yes_reserve_key)
+            .expect("yes reserve not found");
+        let no_reserve: u128 = env
+            .storage()
+            .persistent()
+            .get(&no_reserve_key)
+            .expect("no reserve not found");
+        let current_total_liquidity = yes_reserve
+            .checked_add(no_reserve)
+            .expect("total liquidity overflow");
+        let current_lp_supply: u128 = env.storage().persistent().get(&lp_supply_key).unwrap_or(0);
+
+        let lp_tokens_to_mint =
+            calculate_lp_tokens_to_mint(current_lp_supply, current_total_liquidity, usdc_amount);
+        if lp_tokens_to_mint == 0 {
+            panic!("lp tokens to mint must be positive");
+        }
+
+        // Add liquidity proportionally to preserve pool pricing.
+        let yes_add = if current_total_liquidity == 0 {
+            usdc_amount / 2
+        } else {
+            usdc_amount
+                .checked_mul(yes_reserve)
+                .and_then(|v| v.checked_div(current_total_liquidity))
+                .expect("yes reserve add overflow")
+        };
+        let no_add = usdc_amount
+            .checked_sub(yes_add)
+            .expect("liquidity split underflow");
+
+        if yes_add == 0 || no_add == 0 {
+            panic!("liquidity amount too small");
+        }
+
+        let new_yes_reserve = yes_reserve
+            .checked_add(yes_add)
+            .expect("yes reserve overflow");
+        let new_no_reserve = no_reserve.checked_add(no_add).expect("no reserve overflow");
+        let new_k = new_yes_reserve
+            .checked_mul(new_no_reserve)
+            .expect("k overflow");
+        let new_total_liquidity = current_total_liquidity
+            .checked_add(usdc_amount)
+            .expect("total liquidity overflow");
+
+        let new_lp_supply = current_lp_supply
+            .checked_add(lp_tokens_to_mint)
+            .expect("lp supply overflow");
+        let current_lp_balance: u128 = env.storage().persistent().get(&lp_balance_key).unwrap_or(0);
+        let new_lp_balance = current_lp_balance
+            .checked_add(lp_tokens_to_mint)
+            .expect("lp balance overflow");
+
+        env.storage()
+            .persistent()
+            .set(&yes_reserve_key, &new_yes_reserve);
+        env.storage()
+            .persistent()
+            .set(&no_reserve_key, &new_no_reserve);
+        env.storage().persistent().set(&k_key, &new_k);
+        env.storage()
+            .persistent()
+            .set(&lp_supply_key, &new_lp_supply);
+        env.storage()
+            .persistent()
+            .set(&lp_balance_key, &new_lp_balance);
+
+        let usdc_token: Address = env
+            .storage()
+            .persistent()
+            .get(&Symbol::new(&env, USDC_KEY))
+            .expect("usdc token not set");
+        let token_client = token::Client::new(&env, &usdc_token);
+        token_client.transfer(
+            &lp_provider,
+            env.current_contract_address(),
+            &(usdc_amount as i128),
+        );
+
+        let event = LiquidityAdded {
+            provider: lp_provider.clone(),
+            usdc_amount,
+            lp_tokens_minted: lp_tokens_to_mint,
+            new_reserve: new_total_liquidity,
+            k: new_k,
+        };
+        event.publish(&env);
+
+        lp_tokens_to_mint
     }
 
     /// Remove liquidity from pool (redeem LP tokens)
